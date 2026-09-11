@@ -433,7 +433,8 @@ h2 + .clients {margin-top: 0}
 }
 
 .clients.files .icon-file-check,
-.clients.files .icon-folder {
+.clients.files .icon-folder,
+.clients.files .icon-folder-check {
   margin-right: 8px;
 }
 
@@ -1159,16 +1160,6 @@ ul.pill-navigation {
   color: var(--light-text-color)
 }
 
-
-#contact-form [name="name"],
-#contact-form [name="email"],
-#contact-form [name="message"] {
-  position: absolute;top:-9999px;left:-9999px;
-}
-
-#contact-form [name="contact_e879"] {
-  min-height: 120px;box-sizing: border-box;border:1px solid #dddddc;border-radius: 5px;width:100%;padding:0.5rem;margin:0.5rem 0
-}
 
 .intro {
   max-width: 400px;

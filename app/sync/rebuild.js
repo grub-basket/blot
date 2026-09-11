@@ -3,13 +3,14 @@ const ensure = require("helper/ensure");
 const type = require("helper/type");
 const Update = require("./update");
 const async = require("async");
-const { join, resolve } = require("path");
+const { join, resolve, basename } = require("path");
 const localPath = require("helper/localPath");
 const messenger = require("./messenger");
 const { blog_static_files_dir } = require("config");
 const { promisify } = require("util");
 const Transformer = require("helper/transformer");
 const Blog = require("models/blog");
+const build = require("build");
 
 function walk(dir, done) {
   var results = [];
@@ -21,6 +22,10 @@ function walk(dir, done) {
       file = resolve(dir, file);
       fs.stat(file, function (err, stat) {
         if (stat && stat.isDirectory()) {
+          // A "+" folder is a rebuild target in its own right. Once it has
+          // been emptied no file path surfaces it, but its stale aggregate
+          // entry still needs the EMPTY cleanup, so record the directory too.
+          if (basename(file).endsWith("+")) results.push(file);
           walk(file, function (err, res) {
             results = results.concat(res);
             if (!--pending) done(null, results);
@@ -45,8 +50,14 @@ module.exports = function main(blogID, options, callback) {
   Blog.get({ id: blogID }, function (err, blog) {
     if (err || !blog) return callback(err || new Error("No blog"));
 
-    const { log, status } = messenger(blog);
-    const update = new Update(blog, log, status);
+    const fallbackMessenger =
+      options.log && options.status ? null : messenger(blog);
+    const log = options.log || fallbackMessenger.log;
+    const status = options.status || fallbackMessenger.status;
+    // Update's ordinary "Syncing" statuses would split the progress stream.
+    // Rebuild publishes the more specific, counted status below instead.
+    const updateStatus = function () {};
+    const update = new Update(blog, log, updateStatus);
 
     let blogDirectory = localPath(blog.id, "/");
 
@@ -73,10 +84,40 @@ module.exports = function main(blogID, options, callback) {
         return callback(e);
       }
 
+      // Files inside a + folder all rebuild the same aggregated entry.
+      // Process each multi-folder once so a 50-file album is not built
+      // 50 separate times during a full rebuild.
+      const updatePaths = [];
+      const updatePathCounts = new Map();
+
+      paths.forEach(function (absPath) {
+        var path = absPath.slice(blogDirectory.length);
+        var multiInfo = build.findMultiFolder(path);
+
+        if (multiInfo) {
+          if (!updatePathCounts.has(multiInfo.folderPath)) {
+            updatePaths.push(multiInfo.folderPath);
+            updatePathCounts.set(multiInfo.folderPath, 0);
+          }
+          updatePathCounts.set(
+            multiInfo.folderPath,
+            updatePathCounts.get(multiInfo.folderPath) + 1
+          );
+          return;
+        }
+
+        updatePaths.push(path);
+        updatePathCounts.set(path, 1);
+      });
+
+      const total = paths.length;
+      let current = 0;
+
       async.eachSeries(
-        paths,
+        updatePaths,
         function (path, next) {
-          path = path.slice(blogDirectory.length);
+          current += updatePathCounts.get(path);
+          status(`(${current}/${total}) Rebuilding ${path}`);
           update(path, function () {
             // todo: don't swallow error here
             next();

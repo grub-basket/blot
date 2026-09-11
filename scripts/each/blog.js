@@ -3,6 +3,7 @@ var Blog = require("models/blog");
 var async = require("async");
 var type = require("helper/type");
 var ensure = require("helper/ensure");
+var progress = require("./progress");
 
 module.exports = function (doThis, allDone, options) {
   options = options || {};
@@ -42,6 +43,9 @@ module.exports = function (doThis, allDone, options) {
     }
 
     if (options.o) {
+      // Unlike scripts/get/blog.js (and therefore eachBlogOrOneBlog.js), this
+      // option does not resolve shortened IDs, handles, or domains. Callers
+      // must provide complete blog IDs.
       if (type(options.o, "array")) {
         blogIDs = options.o.map(function (id) {
           return id + "";
@@ -57,14 +61,52 @@ module.exports = function (doThis, allDone, options) {
     }
 
     var forEach = async.eachSeries;
+    var parallel = false;
 
     if (options.p) {
       forEach = async.each;
+      parallel = true;
+    } else if (options.c && parseInt(options.c, 10) > 1) {
+      // Bounded concurrency: overlap the per-blog Redis reads without the
+      // unbounded fan-out of options.p. The nested progress line (Blog x
+      // Template x View) assumes one blog in flight at a time, so with
+      // options.c it only tracks the blog frame reliably - acceptable for a
+      // one-off migration where throughput matters more than a tidy status
+      // line.
+      var limit = parseInt(options.c, 10);
+      parallel = true;
+      forEach = function (items, iterator, cb) {
+        async.eachLimit(items, limit, iterator, cb);
+      };
     }
+
+    // A concurrent run has several equally current blogs. In that case show
+    // only aggregate completed progress rather than a misleading ID, ordinal,
+    // or active-item percentage.
+    var bar = progress.push("Blog", blogIDs.length, {
+      percentage: !parallel,
+    });
+    var activeOrdinal = 0;
 
     forEach(
       blogIDs,
-      function (blogID, nextBlog) {
+      function (blogID, done) {
+        if (!parallel) {
+          activeOrdinal += 1;
+          // Set this before Blog.get so slow reads still identify the blog
+          // currently being processed. Keep it separate from bar.tick(),
+          // which counts only completed (including skipped) blogs.
+          bar.setContext({
+            detail: blogID.slice(0, 12),
+            index: activeOrdinal,
+          });
+        }
+
+        var nextBlog = function (err) {
+          bar.tick();
+          done(err);
+        };
+
         Blog.get({ id: blogID }, function (err, blog) {
           if (err || !blog) {
             return nextBlog();
@@ -82,7 +124,10 @@ module.exports = function (doThis, allDone, options) {
           });
         });
       },
-      allDone
+      function (err) {
+        bar.pop();
+        allDone(err);
+      }
     );
   });
 };

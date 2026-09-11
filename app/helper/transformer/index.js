@@ -1,21 +1,21 @@
 var debug = require("debug")("blot:helper:transformer");
 var client = require("models/client");
+var blogKey = require("models/blog/key");
 var isURL = require("./isURL");
 var Keys = require("./keys");
 var HashFile = require("./hash");
 var download = require("./download");
+var ownHost = require("./ownHost");
 var type = require("../type");
 var ensure = require("../ensure");
 var fs = require("fs-extra");
 var localPath = require("../localPath");
 var config = require("config");
 var join = require("path").join;
+var resolve = require("path").resolve;
 var async = require("async");
 var caseSensitivePath = require("../caseSensitivePath");
 var he = require("he");
-
-// TODO:
-// Fix bug with transformer to handle ESOCKETIMEDOUT error...
 
 // Maps https://cdn.blot.im/blog_xyz/_image_cache/abc.jpg to
 // /_image_cache/abc.jpg to enable us to look up the file quickly
@@ -40,6 +40,34 @@ function Transformer(blogID, name) {
 
   var keys = Keys(blogID, name);
 
+  // Fetched lazily (only once a URL actually needs to be checked) and
+  // memoized for the life of this Transformer, so instances used purely
+  // for local paths never pay for this lookup.
+  var ownHostnamesPromise;
+
+  function getOwnHostnames() {
+    if (!ownHostnamesPromise) {
+      ownHostnamesPromise = client
+        .hmGet(blogKey.info(blogID), ["domain", "handle"])
+        .then(function (res) {
+          return ownHost.hostnames({ domain: res[0], handle: res[1] });
+        })
+        .catch(function (err) {
+          debug(blogID, "failed to fetch own hostnames", err);
+          return [];
+        });
+    }
+
+    return ownHostnamesPromise;
+  }
+
+  // Note: lookup does NOT de-duplicate concurrent calls for the same source
+  // (only repeat calls once a result is cached). Simultaneous callers each
+  // run the transform. They write the same content-hash key so the last
+  // write wins; a non-deterministic or file-writing transform - e.g. the
+  // image cache's optimize(), which mints a uuid per call - can therefore
+  // leave an orphaned artifact. Accepted trade-off, not a bug; see
+  // readme.txt.
   function lookup(src, transform, callback) {
     if (type(src) !== "string") {
       return callback(new Error("Transformer: src is not a string"));
@@ -61,8 +89,34 @@ function Transformer(blogID, name) {
 
     // We check URLs first since isPath is less strict
     if (url) {
-      debug(src, "seemes to be a URL");
-      return fromURL(url, transform, callback);
+      // If this URL is hosted on the blog's own custom domain or its
+      // <handle>.blot.im subdomain, it's very likely a local file being
+      // referenced by its full URL rather than a relative path - fetching
+      // it over HTTP just to get back bytes we already have on disk
+      // needlessly slows builds down. Try resolving it as a local path
+      // first (recursing back through this same function reuses every
+      // local-path fallback below), and only hit the network if that
+      // fails - e.g. the file has since been deleted, or the URL doesn't
+      // actually map onto the folder.
+      return getOwnHostnames().then(function (ownHostnames) {
+        var ownPath = ownHost.resolve(url, ownHostnames);
+
+        if (ownPath) {
+          debug(src, "matches this blog's own domain, trying local path first:", ownPath);
+          return lookup(ownPath, transform, function (err, result, hash) {
+            if (!err) return callback(null, result, hash);
+            debug(
+              src,
+              "local lookup for own-domain URL failed, falling back to network fetch:",
+              err
+            );
+            fromURL(url, transform, callback);
+          });
+        }
+
+        debug(src, "seemes to be a URL");
+        fromURL(url, transform, callback);
+      });
     }
 
     if (path.length > 300) {
@@ -83,9 +137,15 @@ function Transformer(blogID, name) {
       decodedURI = null;
     }
 
-    // Images pulled from Word Documents are stored in the static folder
+    // Images pulled from Word Documents are stored in the static folder.
+    // `src` comes from an <img src> in the rendered entry, so a value like
+    // "../../<other blog id>/secret.jpg" must not be able to climb out of
+    // this blog's own static directory. resolve("/", src) strips any "../"
+    // and yields an absolute path, which join() then re-roots under the
+    // blog's folder - the same containment trick helper/localPath uses.
     tasks.push(function (next) {
-      fullLocalPath = join(config.blog_static_files_dir, blogID, src);
+      var staticRoot = join(config.blog_static_files_dir, blogID);
+      fullLocalPath = join(staticRoot, resolve("/", src));
       fromPath(fullLocalPath, transform, next);
     });
 
@@ -239,10 +299,12 @@ function Transformer(blogID, name) {
 
           if (err) return callback(err);
 
-          setURL(url, headers, hash, result, function (err) {
-            if (err) throw err;
-
-            callback(err, result);
+          setURL(url, headers, hash, result, function (setErr) {
+            // The transform already succeeded. A failed cache write must
+            // not throw from this async callback (crash / hung build) or
+            // discard the result - worst case we transform again next time.
+            if (setErr) debug("failed to cache result for url", url, setErr);
+            callback(null, result);
           });
         });
       });
@@ -270,10 +332,12 @@ function Transformer(blogID, name) {
           // Pass hash so that
           // from URL doesn't have to compute it again
           debug(path, "saving result of new transform");
-          set(hash, result, function (err) {
-            if (err) throw err;
-
-            callback(err, result, hash);
+          set(hash, result, function (setErr) {
+            // Never throw from this async callback. If the cache write
+            // fails, still return the freshly computed result rather than
+            // hanging the build or crashing the process.
+            if (setErr) debug("failed to cache result for hash", hash, setErr);
+            callback(null, result, hash);
           });
         });
       });
@@ -399,7 +463,10 @@ function Transformer(blogID, name) {
 }
 
 function nothing(err) {
-  if (err) throw err;
+  // Default callback for fire-and-forget cache writes. Swallow the error
+  // (log under debug) - throwing here would surface as an unhandled
+  // rejection from the async write and take down the process.
+  if (err) debug("transformer: ignored cache write error", err);
 }
 
 function missing(src) {

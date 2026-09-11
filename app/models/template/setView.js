@@ -16,6 +16,7 @@ var ERROR = require("../../blog/render/error");
 var updateCdnManifest = require("./util/updateCdnManifest");
 var serializeRedisHashValues = require("models/redisHashSerializer");
 var clfdate = require("helper/clfdate");
+var applyUserRetrieveOptions = require("./util/applyUserRetrieveOptions");
 const MAX_VIEW_PAYLOAD_SIZE = 2 * 1024 * 1024;
 
 module.exports = function setView(templateID, updates, callback) {
@@ -224,6 +225,8 @@ module.exports = function setView(templateID, updates, callback) {
 
 				console.log(clfdate(), templateID.slice(0, 12), "setView:", name);
 
+				var existingRetrieve = view.retrieve || {};
+
 				for (var i in updates) {
 					if (updates[i] !== view[i]) changes = true;
 					view[i] = updates[i];
@@ -275,6 +278,26 @@ module.exports = function setView(templateID, updates, callback) {
 					view.partials = _partials;
 				}
 
+				// Drop file-backed partial markers this save no longer references -
+				// neither parsed from the current content nor explicitly passed in
+				// updates.partials - so a "{{> /old.txt}}" edited out of the view
+				// doesn't linger in the persisted map forever. Markers the caller
+				// still declares are kept: they may back a file referenced only
+				// inside an inline partial's body, which parseTemplate can't see.
+				for (var storedPartial in view.partials) {
+					if (
+						storedPartial.charAt(0) === "/" &&
+						!view.partials[storedPartial] &&
+						!(parseResult.partials && storedPartial in parseResult.partials) &&
+						!(
+							updates.partials &&
+							type(updates.partials, "object") &&
+							storedPartial in updates.partials
+						)
+					)
+						delete view.partials[storedPartial];
+				}
+
 				extend(view.partials).and(parseResult.partials);
 
 						detectInfinitePartialDependency(
@@ -284,8 +307,14 @@ module.exports = function setView(templateID, updates, callback) {
 						(infiniteError) => {
 						if (infiniteError) return callback(infiniteError);
 
-						// Merge parser-derived retrieve (e.g. {{title}}) into view.retrieve; do not overwrite user-provided retrieve (includeDraft, filters, etc.)
-						extend(view.retrieve || {}).and(parseResult.retrieve || {});
+						// Parser output is the source of truth for retrieve locals.
+						// Keep user-provided retrieve options (includeDraft, filters)
+						// from the update or the previously stored view.
+						view.retrieve = applyUserRetrieveOptions(
+							parseResult.retrieve || {},
+							updates.retrieve,
+							existingRetrieve
+						);
 
 						view = serializeRedisHashValues(serialize(view, viewModel));
 
@@ -306,13 +335,23 @@ module.exports = function setView(templateID, updates, callback) {
 						Promise.resolve(multi.exec())
 							.then(() => {
 
-								if (!changes) {
+								// Clear this view from template metadata.errors when saving
+								// via the dashboard so fixing a view clears its error state.
+								var clearErrorsIfNeeded = () => {
 									if (metadata.errors && metadata.errors[name]) {
 										delete metadata.errors[name];
-										return setMetadata(templateID, { errors: metadata.errors }, callback);
+										return setMetadata(
+											templateID,
+											{ errors: metadata.errors },
+											callback
+										);
 									}
 
-									return callback();
+									callback();
+								};
+
+								if (!changes) {
+									return clearErrorsIfNeeded();
 								}
 
 								Blog.set(metadata.owner, { cacheID: Date.now() }, (cacheErr) => {
@@ -321,14 +360,7 @@ module.exports = function setView(templateID, updates, callback) {
 									updateCdnManifest(templateID, (manifestErr) => {
 										if (manifestErr) return callback(manifestErr);
 
-										// Clear this view from template metadata.errors when saving
-										// via the dashboard so fixing a view clears its error state
-										if (metadata.errors && metadata.errors[name]) {
-											delete metadata.errors[name];
-											return setMetadata(templateID, { errors: metadata.errors }, callback);
-										}
-
-										callback();
+										clearErrorsIfNeeded();
 									});
 								});
 							})

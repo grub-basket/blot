@@ -2,6 +2,8 @@ describe("transformer", function () {
   var fs = require("fs-extra");
   var Keys = require("../keys");
   var client = require("models/client");
+  var blogKey = require("models/blog/key");
+  var Transformer = require("../index");
   var STATIC_DIRECTORY = require("config").blog_static_files_dir;
 
   // Creates test environment
@@ -86,6 +88,25 @@ describe("transformer", function () {
       done();
     });
   });
+  it("will not resolve a source that climbs out of the blog's static folder", function (done) {
+    var spy = jasmine.createSpy().and.callFake(this.transform);
+
+    // A file that exists in the static root but NOT in this blog's subtree.
+    var secretName = "secret-" + Date.now() + ".txt";
+    var secretPath = STATIC_DIRECTORY + "/" + secretName;
+    fs.outputFileSync(secretPath, "top secret");
+
+    this.transformer.lookup("../" + secretName, spy, function (err, result) {
+      fs.removeSync(secretPath);
+
+      expect(err instanceof Error).toBe(true);
+      expect(err.code).toEqual("ENOENT");
+      expect(spy).not.toHaveBeenCalled();
+      expect(result).not.toBeTruthy();
+      done();
+    });
+  });
+
   it("transforms a file in the blog's static directory", function (done) {
     var fullPath = this.blogDirectory + "/" + this.path;
     var path = "/" + Date.now() + "-" + this.path;
@@ -163,6 +184,62 @@ describe("transformer", function () {
     });
   });
 
+  describe("own-host resolution", function () {
+    beforeEach(function (done) {
+      this.ownHostTransformer = new Transformer(this.blog.id, "own-host");
+
+      // Point this blog's "domain" at "localhost", in Redis, the way a
+      // real blog's custom domain is stored - the transformer looks
+      // this up itself rather than being told. Deliberately portless:
+      // ownHost.resolve() now rejects any URL with an explicit port
+      // (a real custom domain never has one), and the shared test
+      // server only listens on a non-default port, so a URL that could
+      // actually reach it could never be treated as this blog's own
+      // domain anyway - see the two tests below.
+      client
+        .hSet(blogKey.info(this.blog.id), "domain", "localhost")
+        .then(function () {
+          done();
+        });
+    });
+
+    afterEach(function (done) {
+      this.ownHostTransformer.flush(done);
+    });
+
+    it("resolves a URL on the blog's own host from disk instead of fetching it", function (done) {
+      var spy = jasmine.createSpy().and.callFake(this.transform);
+      var ownURL = "http://localhost/" + this.path;
+
+      this.ownHostTransformer.lookup(ownURL, spy, function (err, result) {
+        if (err) return done.fail(err);
+
+        expect(spy).toHaveBeenCalled();
+        // Nothing listens on localhost:80 in this test environment, so
+        // this could only have succeeded by resolving "foo.txt" from
+        // the blog's own folder, never by going over the network.
+        expect(result).toEqual(jasmine.any(Object));
+        expect(result.size).toEqual(jasmine.any(Number));
+        done();
+      });
+    });
+
+    it("falls back to a network fetch when the local file doesn't exist", function (done) {
+      // Nothing listens on localhost:80, so this proves the own-host
+      // branch tried local resolution first (which fails, no such
+      // file), then fell back into the normal network path - it fails
+      // for a different reason (connection refused) than a bare local
+      // lookup would (ENOENT).
+      var missingURL = "http://localhost/this-file-does-not-exist-" + Date.now();
+
+      this.ownHostTransformer.lookup(missingURL, this.transform, function (err) {
+        expect(err).toEqual(jasmine.any(Error));
+        expect(err.code).not.toEqual("ENOENT");
+        done();
+      });
+    });
+  });
+
   it("uses cached transform when the url responds with 304", function (done) {
     var test = this;
     var firstTransform = jasmine.createSpy().and.callFake(test.transform);
@@ -225,6 +302,100 @@ describe("transformer", function () {
         .catch(function (error) {
           done.fail(error);
         });
+    });
+  });
+
+  it("treats a response with only Cache-Control: max-age as fresh", function (done) {
+    var test = this;
+    var firstTransform = jasmine.createSpy().and.callFake(test.transform);
+    var secondTransform = jasmine.createSpy().and.callFake(test.transform);
+
+    // First response is cacheable for an hour via max-age alone (no Expires,
+    // no ETag / Last-Modified). The second queued response has a different
+    // body - if the transformer re-requests it, sizes will differ.
+    test.queueRemoteResponse({
+      body: "fresh body " + Date.now(),
+      etag: null,
+      lastModified: null,
+      headers: { "Cache-Control": "max-age=3600" },
+    });
+    test.queueRemoteResponse({
+      body: "this body should never be fetched " + Date.now(),
+      etag: null,
+      lastModified: null,
+      headers: { "Cache-Control": "max-age=3600" },
+    });
+
+    test.transformer.lookup(test.sequenceUrl, firstTransform, function (err, firstResult) {
+      if (err) return done.fail(err);
+
+      test.transformer.lookup(test.sequenceUrl, secondTransform, function (err, secondResult) {
+        if (err) return done.fail(err);
+
+        expect(firstTransform).toHaveBeenCalled();
+        expect(secondTransform).not.toHaveBeenCalled();
+        expect(secondResult).toEqual(firstResult);
+        done();
+      });
+    });
+  });
+
+  it("revalidates a no-cache response even when it carries a max-age", function (done) {
+    var test = this;
+    var firstTransform = jasmine.createSpy().and.callFake(test.transform);
+    var secondTransform = jasmine.createSpy().and.callFake(test.transform);
+
+    // no-cache means "revalidate before reuse", so the second lookup must
+    // still hit the network despite the hour-long max-age. With no ETag /
+    // Last-Modified the revalidation is a plain 200 with a new body, so the
+    // transform runs again.
+    test.queueRemoteResponse({
+      body: "short " + Date.now(),
+      etag: null,
+      lastModified: null,
+      headers: { "Cache-Control": "no-cache, max-age=3600" },
+    });
+    test.queueRemoteResponse({
+      body: "a considerably longer second body " + Date.now(),
+      etag: null,
+      lastModified: null,
+      headers: { "Cache-Control": "no-cache, max-age=3600" },
+    });
+
+    test.transformer.lookup(test.sequenceUrl, firstTransform, function (err, firstResult) {
+      if (err) return done.fail(err);
+
+      test.transformer.lookup(test.sequenceUrl, secondTransform, function (err, secondResult) {
+        if (err) return done.fail(err);
+
+        expect(firstTransform).toHaveBeenCalled();
+        expect(secondTransform).toHaveBeenCalled();
+        expect(secondResult.size).not.toEqual(firstResult.size);
+        done();
+      });
+    });
+  });
+
+  it("accepts a gzip-encoded response whose Content-Length is the encoded size", function (done) {
+    var test = this;
+    var transform = jasmine.createSpy().and.callFake(test.transform);
+
+    // A compressible body: the gzip Content-Length is far smaller than the
+    // bytes node-fetch yields after decoding, which must not read as a
+    // truncated download.
+    test.queueRemoteResponse({
+      gzip: true,
+      body: "gzipped body ".repeat(64) + Date.now(),
+      etag: null,
+      lastModified: null,
+    });
+
+    test.transformer.lookup(test.sequenceUrl, transform, function (err, result) {
+      if (err) return done.fail(err);
+
+      expect(transform).toHaveBeenCalled();
+      expect(result.size).toEqual(jasmine.any(Number));
+      done();
     });
   });
 
@@ -350,5 +521,42 @@ describe("transformer", function () {
         });
       });
     });
+
+    it("errors instead of hanging when the connection drops mid-download", function (done) {
+      var test = this;
+      var spy = jasmine.createSpy().and.callFake(test.transform);
+
+      test.queueRemoteResponse({ destroy: true });
+
+      test.transformer.lookup(test.sequenceUrl, spy, function (err, result) {
+        expect(err instanceof Error).toBe(true);
+        expect(result).not.toBeTruthy();
+        expect(spy).not.toHaveBeenCalled();
+        done();
+      });
+    }, 20000);
+
+    it("falls back to the cached result when a later download drops mid-body", function (done) {
+      var test = this;
+      var body = "Good body " + Date.now();
+      var firstTransform = jasmine.createSpy().and.callFake(test.transform);
+      var secondTransform = jasmine.createSpy().and.callFake(test.transform);
+
+      test.queueRemoteResponse({ body: body, etag: null, lastModified: null });
+      test.queueRemoteResponse({ destroy: true });
+
+      test.transformer.lookup(test.sequenceUrl, firstTransform, function (err, firstResult) {
+        if (err) return done.fail(err);
+
+        test.transformer.lookup(test.sequenceUrl, secondTransform, function (err, secondResult) {
+          if (err) return done.fail(err);
+
+          expect(firstTransform).toHaveBeenCalled();
+          expect(secondTransform).not.toHaveBeenCalled();
+          expect(secondResult).toEqual(firstResult);
+          done();
+        });
+      });
+    }, 20000);
   });
 });

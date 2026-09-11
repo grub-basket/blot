@@ -6,6 +6,47 @@ describe("backlinks", function () {
       "{{#entry}}{{#backlinks.length}}Backlinks: {{#backlinks}}{{title}}{{/backlinks}}{{/backlinks.length}}{{/entry}}",
   };
 
+  it("renders a backlink when a page links to another page", async function () {
+    // Pages have no entry.permalink (only posts and entries with an
+    // explicit Permalink/Link/Url do), so the linking page has to be
+    // attributed by its entry.url instead or it never registers as
+    // the source of a backlink.
+    await this.write({
+      path: "/pages/target.txt",
+      content: "Page: yes\nTitle: Target Page\n\nContent.",
+    });
+    await this.write({
+      path: "/pages/linker.txt",
+      content: "Page: yes\nTitle: Linker Page\n\n[see target](/target-page)",
+    });
+    await this.template(backlinksTemplate);
+
+    const body = await this.text("/target-page");
+    expect(body).toContain("Backlinks:");
+    expect(body).toContain("Linker Page");
+  });
+
+  it("renders multiple backlinks when several pages link to the same page", async function () {
+    await this.write({
+      path: "/pages/target.txt",
+      content: "Page: yes\nTitle: Target Page\n\nContent.",
+    });
+    await this.write({
+      path: "/pages/linker-a.txt",
+      content: "Page: yes\nTitle: Linker A\n\n[target](/target-page)",
+    });
+    await this.write({
+      path: "/pages/linker-b.txt",
+      content: "Page: yes\nTitle: Linker B\n\n[target](/target-page)",
+    });
+    await this.template(backlinksTemplate);
+
+    const body = await this.text("/target-page");
+    expect(body).toContain("Backlinks:");
+    expect(body).toContain("Linker A");
+    expect(body).toContain("Linker B");
+  });
+
   it("renders backlinks when another post links via markdown", async function () {
     await this.write({ path: "/target.txt", content: "Title: Target\n\nContent." });
     await this.write({
@@ -64,6 +105,50 @@ describe("backlinks", function () {
     expect(body).not.toContain("Backlinks:");
   });
 
+
+  it("does not create a backlink from a resolved link to a plain local file", async function () {
+    const fs = require("fs-extra");
+    await fs.outputFile(this.blogDirectory + "/beach.jpg", "fake image data");
+
+    await this.write({
+      path: "/vacation.txt",
+      content: "Title: Vacation\n\n[Download](beach.jpg)",
+    });
+    await this.template(backlinksTemplate);
+
+    // The link resolves to /beach.jpg (a real file, not a post),
+    // so it must not show up as a backlink anywhere.
+    const body = await this.text("/vacation");
+    expect(body).not.toContain("Backlinks:");
+  });
+
+  it("still creates a backlink from an anchor sharing a path with one the autoImage plugin removed", async function () {
+    // /photo.jpg is a real file, but also deliberately set as another
+    // entry's custom permalink, so the two collide.
+    const fs = require("fs-extra");
+    await fs.outputFile(this.blogDirectory + "/photo.jpg", "fake image data");
+
+    await this.write({
+      path: "/other.txt",
+      content: "Title: Other\nLink: /photo.jpg\n\nContent.",
+    });
+    await this.write({
+      path: "/linker.txt",
+      content:
+        // The bare [photo.jpg](photo.jpg) link resolves to /photo.jpg
+        // and gets converted by the default autoImage plugin into an
+        // <img> - removing that anchor entirely. The second, separate
+        // link is unrelated and must still register as a real
+        // backlink to Other, even though it shares the same resolved
+        // path with the anchor that was just removed.
+        "Title: Linker\n\n[photo.jpg](photo.jpg)\n\n[See other](/photo.jpg)",
+    });
+    await this.template(backlinksTemplate);
+
+    const body = await this.text("/photo.jpg");
+    expect(body).toContain("Backlinks:");
+    expect(body).toContain("Linker");
+  });
 
   it("resolves backlinks from double-encoded href values", async function () {
     await this.write({

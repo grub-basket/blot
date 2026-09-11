@@ -7,6 +7,33 @@ describe("Blogger importer", function () {
   const legacyFixture = path.join(__dirname, "fixtures", "export.xml");
   const atomFixture = path.join(__dirname, "fixtures", "export.atom");
 
+  // The full import pipeline runs helper.download_images / download_pdfs, which
+  // fetch() the external asset URLs embedded in export.xml (e.g.
+  // https://blogger.googleusercontent.com/...). Those real network calls make
+  // the pipeline specs depend on CI egress and time out intermittently
+  // (helper/download_images.js has its own 5s timeout that collides with
+  // Jasmine's). Stub fetch so downloads fail fast and offline; none of these
+  // specs assert on downloaded asset content.
+  let realFetch;
+
+  beforeAll(function () {
+    realFetch = global.fetch;
+    global.fetch = function () {
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        headers: { get: () => null },
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+        text: () => Promise.resolve(""),
+        json: () => Promise.resolve({}),
+      });
+    };
+  });
+
+  afterAll(function () {
+    global.fetch = realFetch;
+  });
+
   it("selects published posts and pages and maps Atom fields", async function () {
     const entries = await blogger.parse(await fs.readFile(legacyFixture, "utf8"));
     expect(entries.length).toBe(5);
@@ -87,6 +114,11 @@ describe("Blogger importer", function () {
       "https://blogger.googleusercontent.com/img/b/ABC/s320/IMG_4534.jpg";
     const other =
       "https://blogger.googleusercontent.com/img/b/ABC/s1600/other.jpg";
+    const opaqueFull =
+      "https://blogger.googleusercontent.com/img/a/AVvXsEgFVMWOiw9WlUf_pZvWu1U3iko0IikKVMN_yg79hHGSISG9NmEpmKXUHSF1cgb3HnaUGwLSamO0Lrfk93DWBjrjofgY-eO_fSUpL_xRnoByt0VBxPByLREtqG_4LFaItKLclPTyAloonludCg5_aIJ3nGBO9BWK2RHg5GQVN2hmUkwitGVjNFNdmzTRjCI";
+    const opaqueThumb = opaqueFull + "=w320-h269";
+    const opaqueOther =
+      "https://blogger.googleusercontent.com/img/a/AVvXsEioelOHnuW_OMF24Sw2jt4PBuTvhF2-jhbFOGTL2YnmkSjtXiDXGrv6IWFKvtZA696TRWDRBVpiN7ujjtlXBJXqtvZzSWCE7Dd70mY4ja-jfhV7ZtAOjusjibOdzCzMuSrlckggHFlIAAXWIyrzfzfEQ_LdLfhP_3KxM7N5XGbPzrdQpJwlYj5Hy2zY2Qw";
 
     expect(
       parse.preferFullSizeImages(
@@ -96,9 +128,21 @@ describe("Blogger importer", function () {
 
     expect(
       parse.preferFullSizeImages(
+        `<a href="${opaqueFull}"><img src="${opaqueThumb}"></a>`
+      )
+    ).toContain(`src="${opaqueFull}"`);
+
+    expect(
+      parse.preferFullSizeImages(
         `<a href="${other}"><img src="${thumb}"></a>`
       )
     ).toContain(`src="${thumb}"`);
+
+    expect(
+      parse.preferFullSizeImages(
+        `<a href="${opaqueOther}"><img src="${opaqueThumb}"></a>`
+      )
+    ).toContain(`src="${opaqueThumb}"`);
 
     expect(
       parse.preferFullSizeImages(

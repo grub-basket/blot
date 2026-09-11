@@ -1,5 +1,10 @@
 const Entry = require("models/entry");
 const fetchTaggedEntries = require("./helpers/fetchTaggedEntries");
+const projectEntryFields = require("./helpers/projectEntryFields");
+const entryFieldList = require("./helpers/entryFieldList");
+const withEntryFields = require("./helpers/withEntryFields");
+const getTemplateSortOptions = require("blog/sortOptions");
+const { sortEntries } = getTemplateSortOptions;
 
 module.exports = function (req, res, callback) {
   const blogID = req.blog.id;
@@ -16,6 +21,7 @@ module.exports = function (req, res, callback) {
   const templateLocals = (req.template && req.template.locals) || {};
   const pathPrefix =
     (res.locals && res.locals.path_prefix) ?? templateLocals.path_prefix;
+  const sortOptions = getTemplateSortOptions(templateLocals);
 
   let preferredLimit;
 
@@ -32,30 +38,52 @@ module.exports = function (req, res, callback) {
 
   const offset = (page - 1) * limit;
 
-  fetchTaggedEntries(blogID, tags, { limit, offset, pathPrefix }, function (err, result) {
-    if (err) return callback(err);
+  fetchTaggedEntries(
+    blogID,
+    tags,
+    { limit, offset, pathPrefix, ...sortOptions },
+    function (err, result) {
+      if (err) return callback(err);
 
-    Entry.get(blogID, result.entryIDs || [], function (entries) {
-      entries.sort((a, b) => b.dateStamp - a.dateStamp);
+      const fields = entryFieldList(req.retrieve, ["tagged"]);
+      const entryIDs = result.entryIDs || [];
 
-      const totalEntries =
-        result.total !== undefined
-          ? result.total
-          : (result.entryIDs || []).length;
+      const withEntries = function (entries) {
+        entries = sortEntries(entries, sortOptions);
 
-      res.locals.pagination = res.locals.pagination || result.pagination || {};
+        projectEntryFields(entries, req.retrieve, ["tagged"]);
 
-      callback(null, {
-        tag: result.tag,
-        tagged: result.tagged,
-        is: result.tagged, // alias
-        entries,
-        pagination: result.pagination,
-        total: totalEntries,
-        entryIDs: result.entryIDs || [],
-        slugs: result.slugs,
-        prettyTags: result.prettyTags,
-      });
-    });
-  });
+        const totalEntries =
+          result.total !== undefined
+            ? result.total
+            : (result.entryIDs || []).length;
+
+        res.locals.pagination = res.locals.pagination || result.pagination || {};
+
+        callback(null, {
+          tag: result.tag,
+          tagged: result.tagged,
+          is: result.tagged, // alias
+          entries,
+          pagination: result.pagination,
+          total: totalEntries,
+          entryIDs: result.entryIDs || [],
+          slugs: result.slugs,
+          prettyTags: result.prettyTags,
+        });
+      };
+
+      if (!fields) return Entry.get(blogID, entryIDs, withEntries);
+
+      withEntryFields(
+        function (cb) {
+          Entry.get(blogID, entryIDs, fields, cb);
+        },
+        function (cb) {
+          Entry.get(blogID, entryIDs, cb);
+        },
+        withEntries
+      );
+    }
+  );
 };

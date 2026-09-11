@@ -4,9 +4,11 @@ var renderLocals = require("./locals");
 var finalRender = require("./main");
 var retrieve = require("./retrieve");
 var getCachedFullView = require("./full-view-cache");
+var hardenProjectedRetrieve = require("models/template/util/hardenProjectedRetrieve");
 
 var ensure = require("helper/ensure");
 var extend = require("helper/extend");
+var getTemplateSortOptions = require("blog/sortOptions");
 var callOnce = require("helper/callOnce");
 var config = require("config");
 var CACHE = config.cache;
@@ -78,7 +80,30 @@ module.exports = function (req, res, _next) {
           .and(req.template.locals)
           .and(blog.locals);
 
+        // Templates may configure sorting as nested `sort: { by, direction }`.
+        // Expose the resolved selection as flat sort_by / sort_order so views
+        // (e.g. Hypertext's navigation) don't have to re-derive it.
+        if (req.template.locals && req.template.locals.sort) {
+          var resolvedSort = getTemplateSortOptions(req.template.locals);
+          if (resolvedSort.sortBy !== undefined)
+            res.locals.sort_by = resolvedSort.sortBy;
+          if (resolvedSort.order !== undefined)
+            res.locals.sort_order = resolvedSort.order;
+        }
+
         extend(res.locals.partials).and(viewPartials);
+
+        // getFullView hardened the projection metadata against the view's own
+        // content, partials and locals. res.locals now also holds the query,
+        // template- and blog-level locals merged above, and renderLocals
+        // evaluates the mustache in all of them - fold their references in
+        // before projection runs at retrieve time. Skip `partials` (already
+        // covered by getFullView, and large).
+        var localsForHardening = {};
+        Object.keys(res.locals).forEach(function (k) {
+          if (k !== "partials") localsForHardening[k] = res.locals[k];
+        });
+        hardenProjectedRetrieve(missingLocals, null, null, localsForHardening);
 
         retrieve(req, res, missingLocals, function (err, foundLocals) {
           extend(res.locals).and(foundLocals);
@@ -100,7 +125,13 @@ module.exports = function (req, res, _next) {
             var locals = res.locals;
             var partials = res.locals.partials;
 
-            // ?debug=true _AND_ ?json=true to get template locals as JSON
+            // This is a public inspection interface for public blog pages. Its
+            // output intentionally includes partials, template and blog locals,
+            // and rendered published-entry data: Blot treats everything in the
+            // public render context as public. Never put credentials, private
+            // account data, unpublished entries, or other secrets in res.locals.
+            // Keep this response no-cache and public (not preview-only) unless
+            // Blot's public-template policy changes.
             if (req.query && (req.query.debug || req.query.json)) {
               if (callback) return callback(null, res.locals);
               res.set("Cache-Control", "no-cache");
